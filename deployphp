@@ -1,0 +1,783 @@
+#!/usr/bin/env perl
+
+# deployphp - deploy PHP source code in production - RORA - 2019-04-16
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use IO::File;
+use Archive::Any::Create;
+use IPC::Open3;
+use JSON;
+use strict;
+use 5.16.0;
+
+my %args_defaults=(
+      target => "",                         # project or path to deploy
+      #path => "",                           # path list to deploy
+      dryrun => 0,                          # dryrun flag
+      backup => 0,                          # make backup in remote server before updating
+      all => 0,                             # update all files (not incremental)
+      exclude => "",                        # list of files to exclude globally
+      exclude_hash => {},                   # hash form of exclude
+      verbose => 0,
+      help => 0,
+      debug => 0,
+      args_file => ".deployphp",
+      args_data => {},
+   );
+
+my %path_defaults=(
+      #path => "",                           # production path to deploy (required)
+      user => "root",                       # user in production path
+      localdir => "./",                     # local directory to deploy from
+      targetdir => "",                      # directory in production path
+      bkpdir => "",                         # backup directory in production path
+      tmpdir => "/tmp",                     # temporary remote dir to store the .tar file
+      ownergroup => "www-data:www-data",    # owner and group of the files in the remote path
+      bkpmask => "backup_%T.tar.gz",        # backup file mask (%T is date/time, %U user)
+      minify => 1,                          # minify the production code
+      testminify => 1,                      # test PHP files if minified (using php -l)
+      minprecomment => "",                  # prepend this comment to minified files
+      compress => "",                       # what compression to use (""=none,"gzip","bzip2")
+      exclude => "",                        # list of files to exclude from deployment in the path
+      exclude_hash => {},                   # hash form of exclude
+      backup => 0,                          # make backup in remote server before updating
+      all => 0,                             # update all files (not incremental)
+   );
+
+# Parse command line, check args, instantiate main obj and run
+my @args_global=(qw/target|t:s exclude|e:s dryrun+ backup|b+ all|a+ help|h debug+ verbose|v+/);
+my $args = {%args_defaults};
+my $parser = Getopt::Long::Parser->new; $|=1;
+if (! $parser->getoptions($args, @args_global) || $args->{help}) {
+  pod2usage(-exitval=>1, -verbose=>1);
+}
+$args->{exclude} = [".deployphp", split(/\s+/, $args->{exclude})];
+die("$0 error: deployment target not specified") if (! defined $args->{target} || $args->{target} eq "");
+my $self = bless($args, __PACKAGE__);
+$self->{filelist} = \@ARGV if ($#ARGV >= 0);
+$self->readconfig($ENV{HOME} . "/" . $args_defaults{args_file});
+$self->readconfig($args_defaults{args_file});
+die("$0 error: starting project or path not found in config file(s)") if (! defined $self->{config}->{$self->{target}});
+map { $self->{exclude_hash}->{$_} = 1 } @{$self->{exclude}};
+my $project = deployProject->new($self, names => $self->buildpathlist($self->{target}));
+$project->deploy;
+
+# Read main and local config files in order
+sub readconfig {
+  my($self, $f)=@_;
+  if (-f $f && -r $f) {
+    my $h = decode_json(`cat $f`);
+    for my $k (keys %{$h}) {
+      if ($k ne "exclude") {
+        $self->{config}->{$k} = $h->{$k};
+      } else {
+        push @{$self->{exclude}}, (@{$h->{exclude}})
+      }
+    }
+  }
+}
+
+# Scan all projects to build a complete (non circular) path list do deploy
+sub buildpathlist {
+  my($self, $start)=@_;
+  my($used, $list);
+  my $open = [$start];
+  while ($#{$open} >= 0) {
+    my $e = pop(@{$open});
+    die("$0 error: project or path \"$e\" not found in config file(s)") if (! defined $self->{config}->{$e});
+    die("$0 error: loop in project or path specification on \"$e\"") if (defined $used->{$e});
+    $used->{$e} = 1;
+    push @{$self->{exclude}}, (@{$self->{config}->{$e}->{exclude}}) if (defined $self->{config}->{$e}->{exclude});
+    if (defined $self->{config}->{$e}->{list}) {
+      push @{$open}, (@{$self->{config}->{$e}->{list}})
+    } else {
+      for my $k ("host", "user", "localdir", "targetdir", "tmpdir", "ownergroup") {
+        die("$0 error: path \"$e\" missing required parameter \"$k\"") if (! defined $self->{config}->{$e}->{$k});
+      }
+      push @{$list}, ($e);
+    }
+  }
+  return($list);
+}
+
+package deployProject; ###############################
+
+# Project class to manage all paths and sub projects
+
+use Data::Dumper;
+use strict;
+
+sub new {
+  my($class)=shift;
+  my $super = shift;
+  my $self = bless({@_, exclude_hash => $super->{exclude_hash}}, $class);
+  for my $t (@{$self->{names}}) {
+    my %v;
+    for my $k (qw/backup verbose debug/) {
+      $v{$k} = 1 if ($super->{$k});
+    }
+    $v{filelist} = $super->{filelist} if (defined $super->{filelist});
+    $v{verbose} = 1 if ($v{debug});
+    push @{$self->{targets}}, (deployPath->new(%{$super->{config}->{$t}}, super => $self, target => $t, %v));
+  }
+  #print "Deploying PHP sources to " . $self->{path} . ($self->{dryrun} ? " (dryrun)" : "") . "\n" if ($self->{verbose});
+  return($self);
+}
+
+# Deploy all PHP projects
+sub deploy {
+  my($self)=@_;
+  my $updatelist = [];
+  for my $path (@{$self->{targets}}) {
+    if ($path->{backup} && $path->{bkpdir} ne "" && $path->{bkpmask} ne "") {
+      $path->backup;
+    }
+    my $list = $path->compiledeploylist;
+    if ($#{$list} >= 0) {
+      $path->upload($list);
+      push @{$updatelist}, ($path);
+    }
+  }
+  for my $path (@{$updatelist}) {
+    $path->update;
+  }
+}
+
+# Return 1 if should exclude file
+sub exclude {
+  my($self, $f)=@_;
+  for my $e (keys %{$self->{exclude_hash}}) {
+    return(1) if ($f =~ /$e/is);
+  }
+  return(0);
+}
+
+1;
+
+package deployPath; ##############################
+
+# One path in the deploy configuration - RORA - 2019-05-23
+
+use IO::File;
+use IPC::Open3;
+use Data::Dumper;
+use strict;
+
+sub new {
+  my($class)=shift;
+  my $self = bless({@_}, $class);
+  for my $k (qw/host user localdir tmpdir targetdir ownergroup/) {
+    die("deployPath error: $k not specified") if (! defined $self->{$k} || $self->{$k} eq "");
+  }
+  map { $self->{exclude_hash}->{$_} = 1 } @{$self->{exclude}};
+  $self->{targetdir} =~ s/\/$//sg;
+  $self->{localdir} =~ s/\/$//sg;
+  return($self);
+}
+
+# compile the list of files to deploy comparing local files to remote files
+sub compiledeploylist {
+  my($self)=@_;
+  my($remoteindex, $updatelist);
+  if (! $self->{all}) {
+    my $remote = $self->findfiles($self->{targetdir}, "ssh", "-n", "-C", "-oPasswordAuthentication=no", $self->{user} . "\@" . $self->{host}, "find $self->{targetdir} -type f -printf '%s;%T\@;%p\\n'");
+    for my $o (@{$remote}) {
+      $remoteindex->{$o->{f}} = $o;
+    }
+  }
+  #print Dumper($remoteindex);
+  my $local = $self->findfiles($self->{localdir}, "find", $self->{localdir}, "-type", "f", "-printf", "%s;%T\@;%p\n");
+  if (! $self->{all}) {
+    for my $o (@{$local}) {
+      my $inc = (! exists $remoteindex->{$o->{f}} || (exists $remoteindex->{$o->{f}} && $o->{time} > $remoteindex->{$o->{f}}->{time}));
+      # cannot compare size because of the minifying: $o->{size} != $remoteindex->{$o->{f}}->{size} || 
+      if ($inc) {
+        print "File $o->{f} ($o->{size} bytes) to update\n" if ($self->{debug});
+        push @{$updatelist}, ($o);
+      }
+    }
+  } else {
+    $updatelist = $local; # with --all, just get all files
+  }
+  if ($#{$updatelist} < 0) {
+    print "No files to update in target \"$self->{target}\"\n" if ($self->{verbose});
+  }
+  return($updatelist);
+}
+
+# update (and minify) the selected files
+sub upload {
+  my($self, $list)=@_;
+  die("Empty upload list") if (! defined $list);
+  print "Uploading " . ($#{$list} + 1) . " files on $self->{user}\@$self->{host}:$self->{targetdir}\n" if ($self->{verbose});
+  $self->{tmppath} = sprintf("%s/deployphp.%d.%d.%d", $self->{tmpdir}, $$, time, rand(10000));
+  my $scriptf = "deployphp_install.sh";
+  my $uploadcmd = "mkdir -p '$self->{tmppath}';echo 'Create dir $self->{tmppath}';cd '$self->{tmppath}';tar xf -;echo 'Uncompressed tar';";
+  my $updatecmd = "cd '$self->{tmppath}';";
+  my $drycom = "";
+  if (! $self->{dryrun}) {
+    $updatecmd .= "/bin/sh $scriptf;cd /;rm -Rf '$self->{tmppath}';echo 'Finished updating'";
+  } else {
+    $updatecmd .= "cd /;rm -Rf '$self->{tmppath}';echo 'Finished dryrun'";
+    $drycom = "#"; # just in case...
+  }
+  my $pid = open3(my $wh, my $rh, undef, "ssh", "-C", "-T", "-oPasswordAuthentication=no", "$self->{user}\@$self->{host}", $uploadcmd);
+  my $script = "echo '" . ($self->{dryrun} ? "Only dryrun" : "Running install script") . "'\n";
+  $script .= "mkdir -p '$self->{targetdir}'\n";
+  my($chownpart, $createdir);
+  my $tar = Archive::Any::Create->new;
+  for my $o (@{$list}) {
+    my $buf = $self->loadcontent($o);
+    my $tmpf = $o->{f} . ".deployphp";
+    $tar->add_file($tmpf, $buf);
+    print "File $o->{f} ($o->{size} bytes) added to the update" . ($self->{minify} ? " minified" : "") . ($self->{compress} ne "" ? " compressed($self->{compress})" : "") . "\n" if ($self->{verbose} || $self->{debug});
+    if ($o->{f} =~ /^(.*)\/([^\/]+)$/) {
+      if (! defined $createdir->{$1}) {
+        $script .= "mkdir -p $self->{targetdir}/$1\n";
+        $createdir->{$1} = 1;
+      }
+    }
+    $script .= "${drycom}mv -f '$self->{tmppath}/$tmpf' '$self->{targetdir}/$o->{f}'\n";
+    if ($self->{user} eq "root") {
+      $chownpart .= "${drycom}chown $self->{ownergroup} '$self->{targetdir}/$o->{f}'\n";
+    }
+  }
+  $script .= $chownpart . "${drycom}echo 'Update install script done.'\n";
+  $tar->add_file($scriptf, $script);
+  $tar->write_filehandle($wh, "tar");
+  close($wh);
+  while (my $line=<$rh>) {
+    $line=~s/[\r\n]*$//gs;
+    if ($line !~ /^debug1: /) {
+      print "> " . &ctrl($line) . "\n" if ($self->{verbose} || $self->{debug});
+    }
+  }
+  close($rh);
+  waitpid($pid,0);
+  $self->{updatecommand} = $updatecmd;
+}
+
+# update all files running the remote install script
+sub update {
+  my($self)=@_;
+  print "Updating files on $self->{user}\@$self->{host}:$self->{targetdir}\n" if ($self->{verbose});
+  my $pid = open3(my $wh, my $rh, undef, "ssh", "-C", "-T", "-oPasswordAuthentication=no", "$self->{user}\@$self->{host}", $self->{updatecommand});
+  close($wh);
+  while (my $line=<$rh>) {
+    $line=~s/[\r\n]*$//gs;
+    if ($line !~ /^debug1: /) {
+      print "> " . &ctrl($line) . "\n" if ($self->{verbose} || $self->{debug});
+    }
+  }
+  close($rh);
+  waitpid($pid,0);
+}
+
+# load the contents of a file to update (minify it or not)
+sub loadcontent {
+  my($self, $o)=@_;
+  my $buf;
+  if ($self->{minify}) {
+    $buf = $self->minify($o);
+  } else {
+    my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r") || die("$0 error: reading $self->{localdir}/$o->{f}: $!");
+    $h->sysread($buf, $o->{size});
+    $h->close;
+  }
+  return($buf);
+}
+
+# minify a PHP source file and return it's contents
+sub minify {
+  my($self, $o)=@_;
+  my $buf;
+  if ($o->{f} =~ /\.php$/i) {
+    $buf = $self->minify_php($o);
+  } elsif ($o->{f} =~ /\.html$/i) {
+    $buf = $self->minify_html($o);
+  } elsif ($o->{f} =~ /\.css$/i) {
+    $buf = $self->minify_css($o);
+  } else {
+    my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r");
+    $h->sysread($buf, $o->{size});
+    $h->close;
+  }
+  if (! defined $buf) {
+    die("$0 error: failed to minify $o->{f}: $self->{error}");
+  }
+  return($buf);
+}
+
+# Minify a PHP source file (using the PHP parser itself) [EXPERIMENTAL]
+sub minify_php {
+  my($self, $o)=@_;
+  my $phpminifier = '
+    /* source: https://stackoverflow.com/questions/503871/best-way-to-automatically-remove-comments-from-php-code */
+    $buf = $last = "";
+    $keep = $inheredoc = 0;
+    $tokens = token_get_all(file_get_contents("' . $self->{localdir} . "/" . $o->{f} . '"));
+    foreach ($tokens as $t) {
+      if ($inheredoc) {
+        if (is_array($t)) {
+          if ($t[0] == T_END_HEREDOC) {
+            $inheredoc = 0;
+            $buf .= $t[1] . "\n";
+          } else {
+            $buf .= $t[1];
+          }
+        } else {
+          $buf .= $t;
+        }
+      } else {
+        if (is_array($t)) {
+          if ($t[0] == T_START_HEREDOC) {
+            $inheredoc = 1;
+            $n = $t[1];
+          } elseif ($t[0] == T_INLINE_HTML) {
+            $n = preg_replace(array("/<!--.*-->/Us","/\s*[\\r\\n]+\s*/"), "", preg_replace("/[\w]\s*[\\r\\n]+\s*[\w]/", " ", preg_replace_callback("/<script([^>]*)>(.*)<\/script>/Us", "cleanJS", $t[1])));
+          } elseif ($t[0] == T_COMMENT || $t[0] == T_DOC_COMMENT) {
+            $n = "";
+          } elseif ($t[0] == T_WHITESPACE) {
+            $keep = preg_match("/[\w]/", $last);
+            $n = "";
+          } elseif ($t[0] == T_CONSTANT_ENCAPSED_STRING || $t[0] == T_ENCAPSED_AND_WHITESPACE) {
+            $n = $t[1];
+            $keep = 0;
+          } else {
+            $n = (($keep && preg_match("/^[\w\$]/", $t[1])) ? " " : "") . preg_replace("/\s*[\\r\\n]+/", "", $t[1]);
+            $last = substr($n, -1);
+            $keep = preg_match("/[\w]/", $last);
+          }
+        } else {
+          $n = $last = ($t == "}" ? " " : "") . $t;
+          $keep = 0;
+        }
+        $buf .= $n;
+      }
+    }
+    print $buf;
+    function cleanJS($m) {
+      return("<script$m[1]>" . preg_replace(array("/\/\/.*$/m", "/\/\*.*\*\//Us"),"",$m[2]) . "</script>");
+    }
+  ';
+  $phpminifier =~ s/[\n]\s*//gs;
+  my $pid = open3(undef, my $rh, undef, "php", "-r", $phpminifier);
+  my $min = $self->{minprecomment};
+  while ((my $r = (sysread($rh, $min, 16384, length($min)))) > 0) {}
+  close($rh);
+  waitpid($pid,0);
+  if ($self->{testminify}) {
+    # test the minified PHP (extra security, but slower)
+    my $tmpf = sprintf("/tmp/deployphp.testfile.%d.%d.%d.php", $$, time(), rand(10000));
+    my $h = IO::File->new($tmpf, "w") || die("$0 error: writing tmp file $tmpf: $!");
+    $h->syswrite($min, length($min));
+    $h->close;
+    my $out = $self->runprocess("php", "-l", $tmpf, "2>&1");
+    die("$0 error: minified php failed for $o->{f}: " . $out->[0]) if ($out->[0] !~ /^No syntax errors detected/);
+    unlink($tmpf);
+  }
+  return($min);
+}
+
+# minify a HTML page
+sub minify_html {
+  my($self, $o)=@_;
+  my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r");
+  my $buf;
+  $h->sysread($buf, $o->{size});
+  $h->close;
+  $buf =~ s/<!--(.*?)-->//gs;            # remove <!-- ... -->
+  $buf =~ s/\s*[\r\n]+\s*/ /gs;          # remove line breaks
+  return($buf);
+}
+
+# minify a CSS
+sub minify_css {
+  my($self, $o)=@_;
+  my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r");
+  my $buf;
+  $h->sysread($buf, $o->{size});
+  $h->close;
+  $buf =~ s/\/\*(.*?)\*\///gs;           # remove /* ... */
+  $buf =~ s/\s*[\r\n]+\s*/ /gs;          # remove line breaks
+  return($buf);
+}
+
+# use find to build a list of files to deploy or compare to production
+sub findfiles {
+  my $self = shift;
+  my $dir = shift;
+  my $pos = length($dir) + ($dir =~ /\/$/? 0 : 1);
+  my $find = $self->runprocess(@_);
+  die("$0 error: permission denied for user $self->{user} at $self->{host}") if ($find->[0] =~ /^Permission denied/);
+  my $list;
+  for my $line (@{$find}) {
+    my($size, $time, $f) = split(/;/,$line);
+    $f = substr($f, $pos);
+    my $ok = 0;
+    if ($#{$self->{filelist}} >= 0) {
+      for my $e (@{$self->{filelist}}) {
+        if ($f =~ /$e/is) {
+          print "Included $f\n" if($self->{debug});
+          $ok = 1;
+        }
+      }
+    } else {
+      $ok = 1;
+    }
+    if ($self->exclude($f)) {
+      print "Excluded $f\n" if ($self->{debug});
+      $ok = 0;
+    }
+    push @{$list},({f=>$f, size=>$size, time=>int($time)}) if ($ok);
+  }
+  return($list);
+}
+
+# faz backup dos arquivos remotos
+sub backup {
+  my($self)=@_;
+  for my $k (qw/host user localdir targetdir/) {
+    die("deployPath error: $k not specified") if (! defined $self->{$k} || $self->{$k} eq "");
+  }
+  my @T=localtime(time);
+  my $datetime = sprintf("%04d-%02d-%02dT%02d-%02d-%02d", $T[5]+1900, $T[4]+1, $T[3], $T[2], $T[1], $T[0]);
+  my $f = $self->{bkpmask};
+  $f =~ s/%T/$datetime/s;
+  $f =~ s/%U/$self->{user}/s;
+  print "Backing" . ($self->{dryrun} ? " (dryrun)" : "") . " up files to $self->{user}\@$self->{host}:$self->{bkpdir}/$f\n" if ($self->{verbose});
+  my @cmd = ("ssh", "-C", "-n", "-oPasswordAuthentication=no", "$self->{user}\@$self->{host}", "cd $self->{targetdir};tar cfz $self->{bkpdir}/$f ./");
+  if (! $self->{dryrun}) {
+    my $out = $self->runprocess(@cmd);
+    if ($self->{debug}) {
+      foreach my $l (@{$out}) {
+        print "ssh> $l\n";
+      }
+    }
+  } else {
+    print "dryrun> " . join(" ", @cmd) . "\n";
+  }
+}
+
+# Return 1 if should exclude file
+sub exclude {
+  my($self, $f)=@_;
+  for my $e (keys %{$self->{exclude_hash}}) {
+    return(1) if ($f =~ /$e/is);
+  }
+  return($self->{super}->exclude($f));
+}
+
+# run something and return stdout
+sub runprocess {
+  my $self=shift;
+  print "Running " . &ctrl(join(" ", @_)) . "\n" if ($self->{debug});
+  my $pid = open3(my $wh, my $rh, undef, @_);
+  my $out;
+  while (my $line=<$rh>) {
+    $line=~s/[\r\n]*$//gs;
+    #print "line: [$line]\n";
+    push @{$out},(&ctrl($line));
+  }
+  close($rh);
+  close($wh);
+  waitpid($pid,0);
+  return($out);
+}
+
+# substitute control chars
+sub ctrl {
+  my($s)=@_;
+  $s=~s/([\0-\x1f\x7e-\xff])/"(".unpack("H2",$1).")"/gse;
+  return($s);
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+deployphp - Deploy PHP/HTML/CSS source files to a production server
+
+=head1 SYNOPSIS
+
+  deployphp --target|t=TARGET [--exclude|e=FILE] [--dryrun] [--backup|b] [--all]
+    [--help|h] [--verbose|v] [--debug] [file1 file2 ...]
+
+=head1 OPTIONS
+
+Options:
+
+  --target=TARGET
+  -t TARGET
+      Specify the target name for deployment. Targets can be a project or a
+      path. Both are pre-defined in a config file (see below). If not,
+      deployphp will fail. Required argument. Default: "".
+ 
+  --exclude=FILE
+  -e FILE
+      Exclude these files from deployment. Use this to list files created on
+      the development environments that should not be sent to production. Is
+      usefull to keep a develop or desenv directory for that and use
+      --exclude='\\/desenv\\/' for all of them. Files are separated by space.
+      Default is "".
+
+  --dryrun
+      Simulate the updating but don't touch production files. Files are
+      minified, compressed, tared, sent to the production server and erased.
+      Default is off.
+
+  --backup
+  -b
+      Make a tar.gz backup file of all files in production before updating.
+      Usefull to revert back in case of failure/bugs/etc. The backup is placed
+      in the bkpdir path (also can be set) with the bkpmask name (can be set).
+      Default is off ("0").
+      
+  --all
+      Send all files to production, do not compare dates and times. This
+      should be used for force an update. Normally only incremental updates
+      will be used to update a project. If the production directory is empty
+      all files will be copied anyway, no need to use --all. Default is off.
+
+  --verbose
+  -v
+      Be verbose.
+
+  --help
+      Show this help.
+
+  --debug
+      Turn on debug mode, very verbose.
+
+=head1 DESCRIPTION
+
+  deployphp is a perl program do deploy PHP source files to a production
+  environment (irony). It updates or copies PHP project files to a production
+  server taking care of several routine tasks to ensure consistency and
+  automation. Files can be backed up in the production server before updating.
+  New files can be minified and compressed to improve performance and to avoid
+  "in production changes/tampering". To use deployphp, a SSH key must be
+  set-up. This program does not work with passwords, only SSH public keys.
+
+  By default, only newer files are updated to the production server.
+  deployphp will generate a list of files in both production and local paths
+  and compare them for modification dates and times. Then newer files will be
+  sent using SSH to a temporary directory and then moved to the final place by
+  a script remotelly. If neither --minify nor --compress are used, files will
+  be left as copies from the local path to the production.
+
+  The --all option can be used to force deployphp to copy all files without
+  checking dates and times. This will make deployphp not work incrementally.
+  A file list can also be supplied in the command line after the args. This
+  will make deployphp work only with the files supplied. But dates and times
+  will still be checked and files will be copied only if they are newer.
+
+  deployphp will first search and parse the configuration file
+  $HOME/.deployphp and then the one on the current directory. Parameters of
+  the second config file will superseed the ones in the first config file.
+  Config files are in JSON format. See section bellow for a description of the
+  syntax. Both config files use the same syntax.
+
+  The list of files to update is built based on the target parameter informed
+  at runtime. The target can be a project or a single path. Both have to be
+  pre-defined in a config file or deployphp will fail. A path is one local
+  directory of files (including it's subdirectories) and a remote host. The
+  same local path or the same remote host can be used in different paths in a
+  config file. A project is a list of paths and or other projects. This way,
+  by calling deployphp informing a project, several paths will be updated at
+  once.
+
+  The update process is sequenced across all files (even if files are from
+  different paths). First all dates and times of files will be compared to
+  their remote dates and times. If --all is not used only newer files will be
+  updated.  Second backup will be performed in the remote host if --backup is
+  used (or backup is 1 in the config). Third files will be copied to a
+  temporary directory in the remote host but not updated. Fourth files are
+  updated by calling the update script that moves files to the final
+  destination, overwriting old ones. Fifth temporary files are removed. In
+  case of errors, update is halted.
+
+=head1 CONFIGURATION
+
+  deployphp config files have to be valid JSON. The basic syntax is a JSON
+  hash containing one or more keys. Each key can be a project, a path or an
+  exclude list. The exclude list will be used to remove files from the update.
+  A exclude key in any config's file root will be global to all projects or
+  paths. Each element in the exclude list is a regexp exmpression that will
+  be tested against all files. Projects are a list of other projects or paths.
+  And paths are one local directory and one remote host.
+
+  This is an exmple of a deployphp configuration file:
+
+  {
+    "all":{
+      "comment":"a project containing two paths",
+      "list":[
+        "server1",
+        "server2"
+      ],
+      "backup":1
+    },
+    "server1":{
+      "comment":"one path",
+      "host":"server1.domain.com",
+      "user":"root",
+      "localdir":"/home/debian/php/project1",
+      "targetdir":"/var/www/html",
+      "bkpdir":"/var/www/bkp",
+      "tmpdir":"/tmp",
+      "ownergroup":"www-data:www-data",
+      "minprecomment":"<?php /* DO NOT CHANGE FILES IN PRODUCTION! */ ?>",
+      "minify": "1",
+      "compress": "gzip",
+      "backup": 0,
+      "verbose": "1"
+    },
+    "server2":{
+      "comment":"other path",
+      ...
+    },
+    "exclude":[
+      "deployphp", "^info.php$", "00about.txt", "Session.vim", "TODO",
+      "\\.sw.$", "^.#", "~$", "\\.bz2$", "\\.gz$", "\\.pl$", "\\.sh$", "\\.htm$",
+      "\\bCVS\\/", "\\.git\\/", "\\bdevel\\/"
+    ]
+  }
+
+  The configuration file defines two paths (server1 and server2) and a project
+  (all). By invoking deployphp --target=all updates all files in server1 and
+  server2. Note that backup will be done even if the backup flag is 0 in
+  server1 because flags have higher precedence in the project "all" that
+  included the "server1" path.
+
+  The exclusion list is specially good for specifying a list of what not to
+  send to production, like backup files, swap files, development directories
+  and test files, etc.  
+
+=head2 PROJECT CONFIG PARAMETERS
+
+  Configuration parameters for projects are:
+
+  comment (string)
+    Not parsed, used to insert a comment.
+
+  list (array)
+    Array of other projects or paths that will be included in the update.
+
+  exclude (array)
+    List of regular expressions to remove files from the update list.
+    Exclusions specified here will be used in included paths.
+    Default is "".
+
+  backup (bool)
+    Flag (0|1) to to backup or not. If 1, will force backup to included paths.
+
+  verbos (bool)
+    Flag (0|1) to show more messsages. If 1, will force verbose to included
+    paths.
+
+=head2 PATH CONFIG PARAMETERS
+
+  Configuration parameters for paths are:
+
+  comment (string)
+    Not parsed, used to insert a comment.
+
+  host (string)
+    Fully qualified remote host.
+
+  user (string)
+    User name with SSH access without password to the production server and
+    the remote PATH to update/access all files. This user will be used in
+    the SSH commands issued to the production server. Default is "root".
+
+  targetdir (string)
+    Base directory on the production server where the PHP files will be
+    deployed. Files in subdirectories will be copied to the apropriate
+    path. Required argument. Default is "".
+
+  localdir (string)
+    Local base directory containing the PHP files. Subdirectories (unless
+    included in the exclusion list will be updated). Default is ".".
+
+  bkpdir (string)
+    Directory where the backup tar files will be written if --backup
+    is supplied. Default is "".
+
+  bkpmask (string)
+    Mask of the backup file created on the production server with the
+    backup of all files before updating. %T is substituted for the
+    current date and time and %U is substituted by the user.
+    Default is "backup_%T.tar.gz".
+
+  tmpdir (string)
+    Temporary directory where files will be uncompress on the production
+    server and removed after updating. The directory will be created if not
+    existent. Any pre-existing files in this directory can be overwritten.
+    Default is "/tmp/deployphp". 
+
+  ownergroup (string)
+    Owner and group of the project files on the production server.
+    Default is "www-data:www-data".
+
+  minify (bool)
+    If set PHP, HTML and CSS files will be minified removing comments,
+    whitespaces and indentation keeping internal strings intact (PHP
+    source code). Better results are achieved when all HTML inline code
+    is kept between ?> and <? tags. If files are minified, a comment
+    will be prepended to all PHP source code (minprecomment argument).
+    Default is off ("0"). [EXPERIMENTAL] Use with care and test first!
+
+  minprecomment (string)
+    If minify is set this comment will be prepended to all PHP source
+    code. The goal is the add a warning to the files in a for of
+    comment. The comment should be in the syntax <?php /* warning */ ?>
+    rather then //, or the file will be ignored by the interpreter.
+    [EXPERIMENTAL] Use with care and test first! Default is "".
+
+  compress (string)
+    Compress files using ALG algorythm on the production server. This is
+    usefull when the HTTP server can read and server the compressed files to
+    the client. This saves CPU and diskspace because all files will be pre
+    compressed. Compression can be gzip or bzip2.
+    [NOT IMPLEMENTED] [TODO] Default is off ("").
+
+  exclude (array)
+    List of regular expressions to remove files from the update list.
+    Default is "".
+
+  backup (bool)
+    Flag (0|1) to to backup or not.
+
+  verbos (bool)
+    Flag (0|1) to show more messsages.
+
+=head1 EXAMPLE
+
+  deployphp --target=all -v
+
+  deployphp --target=server1 --backup --all --minify --compress=gzip
+
+=head1 PREREQUISITES
+
+  deployphp requires:
+
+  - rsync (installed both locally and on the production server)
+  - SSH public keys for access to the production environments
+  - config files defining all projects and/or paths used
+
+=head1 TODO
+
+  - Implement file compression.
+  - Projects are not "stackable". Right now there is only one that instantiates all paths.
+  - Detect invalid comments (//) in the code and report it
+
+=head1 AUTHOR
+
+  deployphp was developed by Rodrigo Antunes - https://rora.com.br
+
+=cut
