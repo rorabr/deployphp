@@ -115,7 +115,7 @@ sub new {
   my $self = bless({@_, exclude_hash => $super->{exclude_hash}}, $class);
   for my $t (@{$self->{names}}) {
     my %v;
-    for my $k (qw/backup verbose debug/) {
+    for my $k (qw/all backup verbose debug/) {
       $v{$k} = 1 if ($super->{$k});
     }
     $v{filelist} = $super->{filelist} if (defined $super->{filelist});
@@ -313,17 +313,23 @@ sub minify {
 # Minify a PHP source file (using the PHP parser itself) [EXPERIMENTAL]
 sub minify_php {
   my($self, $o)=@_;
+  # source: https://stackoverflow.com/questions/503871/best-way-to-automatically-remove-comments-from-php-code
   my $phpminifier = '
-    /* source: https://stackoverflow.com/questions/503871/best-way-to-automatically-remove-comments-from-php-code */
     $buf = $last = "";
     $keep = $inheredoc = 0;
-    $tokens = token_get_all(file_get_contents("' . $self->{localdir} . "/" . $o->{f} . '"));
+    $tokens = token_get_all(preg_replace("/<\?echo/", "<?php echo ", preg_replace("/<\?if/", "<?php if", preg_replace("/<\\?(\\s)/", "<?php$1", file_get_contents("' . $self->{localdir} . "/" . $o->{f} . '")))), TOKEN_PARSE);
     foreach ($tokens as $t) {
+      /* for debugging the minifier:
+      if (is_array($t)) {
+        print token_name($t[0]) . ": " . $t[1] . "\n";
+      } else {
+        print "\"$t\"\n";
+      } */
       if ($inheredoc) {
         if (is_array($t)) {
           if ($t[0] == T_END_HEREDOC) {
             $inheredoc = 0;
-            $buf .= $t[1] . "\n";
+            $buf .= $t[1] . "\\n";
           } else {
             $buf .= $t[1];
           }
@@ -336,19 +342,19 @@ sub minify_php {
             $inheredoc = 1;
             $n = $t[1];
           } elseif ($t[0] == T_INLINE_HTML) {
-            $n = preg_replace(array("/<!--.*-->/Us","/\s*[\\r\\n]+\s*/"), "", preg_replace("/[\w]\s*[\\r\\n]+\s*[\w]/", " ", preg_replace_callback("/<script([^>]*)>(.*)<\/script>/Us", "cleanJS", $t[1])));
+            $n = preg_replace(array("/<!--.*-->/Us","/\\s*[\\r\\n]+\\s*/"), "", preg_replace("/[\\w]\\s*[\\r\\n]+\\s*[\\w]/", " ", preg_replace_callback("/<script([^>]*)>(.*)<\\/script>/Us", "cleanJS", $t[1])));
           } elseif ($t[0] == T_COMMENT || $t[0] == T_DOC_COMMENT) {
             $n = "";
           } elseif ($t[0] == T_WHITESPACE) {
-            $keep = preg_match("/[\w]/", $last);
+            $keep = preg_match("/[\\w]/", $last);
             $n = "";
           } elseif ($t[0] == T_CONSTANT_ENCAPSED_STRING || $t[0] == T_ENCAPSED_AND_WHITESPACE) {
             $n = $t[1];
             $keep = 0;
           } else {
-            $n = (($keep && preg_match("/^[\w\$]/", $t[1])) ? " " : "") . preg_replace("/\s*[\\r\\n]+/", "", $t[1]);
+            $n = (($keep && preg_match("/^[\\w\\$]/", $t[1])) ? " " : "") . preg_replace("/\\s*[\\r\\n]+/", "", $t[1]);
             $last = substr($n, -1);
-            $keep = preg_match("/[\w]/", $last);
+            $keep = preg_match("/[\\w]/", $last);
           }
         } else {
           $n = $last = ($t == "}" ? " " : "") . $t;
@@ -359,7 +365,7 @@ sub minify_php {
     }
     print $buf;
     function cleanJS($m) {
-      return("<script$m[1]>" . preg_replace(array("/\/\/.*$/m", "/\/\*.*\*\//Us"),"",$m[2]) . "</script>");
+      return("<script$m[1]>" . preg_replace(array("/\\/\\/.*$/m", "/\\/\\*.*\\*\\//Us"),"",$m[2]) . "</script>");
     }
   ';
   $phpminifier =~ s/[\n]\s*//gs;
