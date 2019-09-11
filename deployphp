@@ -95,11 +95,27 @@ sub buildpathlist {
     } else {
       for my $k ("host", "user", "localdir", "targetdir", "tmpdir", "ownergroup") {
         die("$0 error: path \"$e\" missing required parameter \"$k\"") if (! defined $self->{config}->{$e}->{$k});
+        $self->{config}->{$e}->{$k} = $self->substvar($self->{config}->{$e}->{$k});
       }
       push @{$list}, ($e);
     }
   }
   return($list);
+}
+
+# Substitute variables in config file format: ${VAR}
+sub substvar {
+  my($self, $str) = @_;
+  $str =~ s/\$\{USER\}/$self->checkvariable("\$ENV{USER}", $ENV{USER})/sgie;
+  $str =~ s/\$\{PWD\}/$self->checkvariable("\$ENV{PWD}", $ENV{PWD})/sgie;
+  return($str);
+}
+
+# Check if an env variable is set or die
+sub checkvariable {
+  my($self, $var, $value) = @_;
+  die("$0 error: variable \"$var\" not set or null, required by configuration") if (! defined $value || $value eq "");
+  return($value);
 }
 
 package deployProject; ###############################
@@ -631,8 +647,8 @@ Options:
     "server1":{
       "comment":"one path",
       "host":"server1.domain.com",
-      "user":"root",
-      "localdir":"/home/debian/php/project1",
+      "user":"${USER}",
+      "localdir":"${PWD}/project1",
       "targetdir":"/var/www/html",
       "bkpdir":"/var/www/bkp",
       "tmpdir":"/tmp",
@@ -663,6 +679,10 @@ Options:
   The exclusion list is specially good for specifying a list of what not to
   send to production, like backup files, swap files, development directories
   and test files, etc.  
+
+  The config variables host, user, localdir, targetdir, tmpdir and ownergroup
+  can use variables to be substituted in runtime. These variables are USER
+  (current user) and PWD (current directory). Variables are used as ${VAR}.
 
 =head2 PROJECT CONFIG PARAMETERS
 
