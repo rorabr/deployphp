@@ -15,6 +15,7 @@ use 5.16.0;
 my %args_defaults=(
       target => "",                         # project or path to deploy
       #path => "",                           # path list to deploy
+      deploylist => "",                     # filename with list of files to deploy
       dryrun => 0,                          # dryrun flag
       backup => 0,                          # make backup in remote server before updating
       all => 0,                             # update all files (not incremental)
@@ -47,7 +48,7 @@ my %path_defaults=(
    );
 
 # Parse command line, check args, instantiate main obj and run
-my @args_global=(qw/target|t:s exclude|e:s dryrun+ backup|b+ all|a+ help|h debug+ verbose|v+/);
+my @args_global=(qw/target|t:s exclude|e:s dryrun+ deploylist|l:s backup|b+ all|a+ help|h debug+ verbose|v+/);
 my $args = {%args_defaults};
 my $parser = Getopt::Long::Parser->new; $|=1;
 if (! $parser->getoptions($args, @args_global) || $args->{help}) {
@@ -165,7 +166,10 @@ sub deploy {
 sub exclude {
   my($self, $f)=@_;
   for my $e (keys %{$self->{exclude_hash}}) {
-    return(1) if ($f =~ /$e/is);
+    if ($f =~ /$e/is) {
+      #print "excluded by [$e]\n";
+      return(1);
+    }
   }
   return(0);
 }
@@ -188,6 +192,15 @@ sub new {
     die("deployPath error: $k not specified") if (! defined $self->{$k} || $self->{$k} eq "");
   }
   map { $self->{exclude_hash}->{$_} = 1 } @{$self->{exclude}};
+  if ($self->{deploylist} ne "") {
+    print "Reading file deploy list from $self->{deploylist}\n" if ($self->{debug});
+    my $h = IO::File->new($self->{deploylist}, "r");
+    while ((my $f = $h->getline)) {
+      chomp($f);
+      $self->{deploylist_hash}->{"$f"} = 1;
+    }
+    $h->close;
+  }
   $self->{targetdir} =~ s/\/$//sg;
   $self->{localdir} =~ s/\/$//sg;
   return($self);
@@ -442,9 +455,14 @@ sub findfiles {
     if ($#{$self->{filelist}} >= 0) {
       for my $e (@{$self->{filelist}}) {
         if ($f =~ /$e/is) {
-          print "Included $f\n" if($self->{debug});
+          print "Included (cmdl) $f\n" if($self->{debug});
           $ok = 1;
         }
+      }
+    } elsif (defined $self->{deploylist_hash}) {
+      if ($self->{deploylist_hash}->{"$f"} == 1) {
+        print "Included (list) $f\n" if($self->{debug});
+        $ok = 1;
       }
     } else {
       $ok = 1;
@@ -487,7 +505,10 @@ sub backup {
 sub exclude {
   my($self, $f)=@_;
   for my $e (keys %{$self->{exclude_hash}}) {
-    return(1) if ($f =~ /$e/is);
+    if ($f =~ /$e/is) {
+      #print "excluded by [$e]\n";
+      return(1);
+    }
   }
   return($self->{super}->exclude($f));
 }
