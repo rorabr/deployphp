@@ -358,7 +358,7 @@ sub minify_php {
             $inheredoc = 1;
             $n = $t[1];
           } elseif ($t[0] == T_INLINE_HTML) {
-            $n = preg_replace(array("/<!--.*-->/Us","/\\s*[\\r\\n]+\\s*/"), "", preg_replace("/[\\w]\\s*[\\r\\n]+\\s*[\\w]/", " ", preg_replace_callback("/<script([^>]*)>(.*)<\\/script>/Us", "cleanJS", $t[1])));
+            $n = preg_replace(array("/<!--(.*)?-->/Us","/\\/\\*(.*)?\\*\\//Us"), "", preg_replace("/\\s*[\\r\\n]+\\s*/", " ", preg_replace_callback("/<script([^>]*)>(.*)<\\/script>/Us", "cleanJS", $t[1])));
           } elseif ($t[0] == T_COMMENT || $t[0] == T_DOC_COMMENT) {
             $n = "";
           } elseif ($t[0] == T_WHITESPACE) {
@@ -381,7 +381,7 @@ sub minify_php {
     }
     print $buf;
     function cleanJS($m) {
-      return("<script$m[1]>" . preg_replace(array("/\\/\\/.*$/m", "/\\/\\*.*\\*\\//Us"),"",$m[2]) . "</script>");
+      return("<script$m[1]>" . preg_replace(array("/^\\s*\\/\\/.*$/m","/\\/\\*(.*)?\\*\\//Us"),"",$m[2]) . "</script>");
     }
   ';
   $phpminifier =~ s/[\n]\s*//gs;
