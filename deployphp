@@ -37,14 +37,19 @@ my %path_defaults=(
       ownergroup => "www-data:www-data",    # owner and group of the files in the remote path
       bkpmask => "backup_%T.tar.gz",        # backup file mask (%T is date/time, %U user)
       minify => 1,                          # minify the production code
+      minifyexclude => [],                  # list of exclusions
       testminify => 1,                      # test PHP files if minified (using php -l)
       minprecomment => "",                  # prepend this comment to minified files
       compress => "",                       # what compression to use (""=none,"gzip","bzip2")
       exclude => "",                        # list of files to exclude from deployment in the path
       exclude_hash => {},                   # hash form of exclude
+      minifyexclude_hash => {},             # hash form of minification exclude
       backup => 0,                          # make backup in remote server before updating
       all => 0,                             # update all files (not incremental)
    );
+
+#&deployPath::test_minify_php(bless({}, "deployPath"), "devel/org/notf.php");
+#exit;
 
 # Parse command line, check args, instantiate main obj and run
 my @args_global=(qw/target|t:s exclude|e:s dryrun+ backup|b+ all|a+ help|h debug+ verbose|v+/);
@@ -188,6 +193,7 @@ sub new {
     die("deployPath error: $k not specified") if (! defined $self->{$k} || $self->{$k} eq "");
   }
   map { $self->{exclude_hash}->{$_} = 1 } @{$self->{exclude}};
+  map { $self->{minifyexclude_hash}->{$_} = 1 } @{$self->{minifyexclude}};
   $self->{targetdir} =~ s/\/$//sg;
   $self->{localdir} =~ s/\/$//sg;
   return($self);
@@ -203,7 +209,6 @@ sub compiledeploylist {
       $remoteindex->{$o->{f}} = $o;
     }
   }
-  #print Dumper($remoteindex);
   my $local = $self->findfiles($self->{localdir}, "find", $self->{localdir}, "-type", "f", "-printf", "%s;%T\@;%p\n");
   if (! $self->{all}) {
     for my $o (@{$local}) {
@@ -245,10 +250,10 @@ sub upload {
   my($chownpart, $createdir);
   my $tar = Archive::Any::Create->new;
   for my $o (@{$list}) {
-    my $buf = $self->loadcontent($o);
+    my $mbuf = $self->loadcontent($o);
     my $tmpf = $o->{f} . ".deployphp";
-    $tar->add_file($tmpf, $buf);
-    print "File $o->{f} ($o->{size} bytes) added to the update" . ($self->{minify} ? " minified" : "") . ($self->{compress} ne "" ? " compressed($self->{compress})" : "") . "\n" if ($self->{verbose} || $self->{debug});
+    $tar->add_file($tmpf, $mbuf->{buf});
+    print "File $o->{f} ($o->{size} bytes) added to the update" . ($mbuf->{minify} ? " minified" : "") . ($self->{compress} ne "" ? " compressed($self->{compress})" : "") . "\n" if ($self->{verbose} || $self->{debug});
     if ($o->{f} =~ /^(.*)\/([^\/]+)$/) {
       if (! defined $createdir->{$1}) {
         $script .= "mkdir -p $self->{targetdir}/$1\n";
@@ -296,26 +301,33 @@ sub loadcontent {
   my($self, $o)=@_;
   my $buf;
   if ($self->{minify}) {
-    $buf = $self->minify($o);
-  } else {
-    my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r") || die("$0 error: reading $self->{localdir}/$o->{f}: $!");
-    $h->sysread($buf, $o->{size});
-    $h->close;
+    return($self->minify($o));
   }
-  return($buf);
+  my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r") || die("$0 error: reading $self->{localdir}/$o->{f}: $!");
+  $h->sysread($buf, $o->{size});
+  $h->close;
+  return({minify => 0, buf => $buf});
 }
 
 # minify a PHP source file and return it's contents
 sub minify {
   my($self, $o)=@_;
+  my $min = 1;
+  for my $e (keys %{$self->{minifyexclude_hash}}) {
+    $min = 0 if ($o->{f} =~ /$e/is);
+  }
   my $buf;
-  if ($o->{f} =~ /\.php$/i) {
-    $buf = $self->minify_php($o);
-  } elsif ($o->{f} =~ /\.html$/i) {
-    $buf = $self->minify_html($o);
-  } elsif ($o->{f} =~ /\.css$/i) {
-    $buf = $self->minify_css($o);
-  } else {
+  if ($min) {
+    if ($o->{f} =~ /\.php$/i) {
+      $buf = $self->minify_php($o);
+    } elsif ($o->{f} =~ /\.html$/i) {
+      $buf = $self->minify_html($o);
+    } elsif ($o->{f} =~ /\.css$/i && $o->{f} !~ /\.min\./) {
+      $buf = $self->minify_css($o);
+    }
+  }
+  if (! defined($buf)) {
+    $min = 0;
     my $h = IO::File->new($self->{localdir} . "/" . $o->{f}, "r");
     $h->sysread($buf, $o->{size});
     $h->close;
@@ -323,7 +335,7 @@ sub minify {
   if (! defined $buf) {
     die("$0 error: failed to minify $o->{f}: $self->{error}");
   }
-  return($buf);
+  return({minify => $min, buf => $buf});
 }
 
 # Minify a PHP source file (using the PHP parser itself) [EXPERIMENTAL]
@@ -368,7 +380,7 @@ sub minify_php {
             $n = $t[1];
             $keep = 0;
           } else {
-            $n = (($keep && preg_match("/^[\\w\\$]/", $t[1])) ? " " : "") . preg_replace("/\\s*[\\r\\n]+/", "", $t[1]);
+            $n = (($keep && preg_match("/^[\\w\\$\\?]/", $t[1])) ? " " : "") . preg_replace("/\\s*[\\r\\n]+/", "", $t[1]);
             $last = substr($n, -1);
             $keep = preg_match("/[\\w]/", $last);
           }
@@ -401,6 +413,16 @@ sub minify_php {
     unlink($tmpf);
   }
   return($min);
+}
+
+# a small test function
+sub test_minify_php {
+  my($self, $f) = @_;
+  $self->{localdir} = ".";
+  my $buf = $self->minify_php({f => $f});
+  my $h = IO::File->new($f . ".min", "w") || die("error writing to $f: $!");
+  $h->syswrite($buf, length($buf));
+  $h->close();
 }
 
 # minify a HTML page
